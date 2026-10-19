@@ -1,11 +1,13 @@
-// Mac front end: with DM_WINDOW=1 open a window (CAMetalLayer, for the graphics backend to present frames) + keyboard → dm_input; the guest runs on a large-stack thread instead and the main thread belongs to AppKit.
+// Mac front end: with DM_WINDOW=1 open a window (CAMetalLayer, for the graphics backend to present frames) + keyboard → dm_input + GameController pads → dm_pad_set; the guest runs on a large-stack thread instead and the main thread belongs to AppKit.
 // Without DM_WINDOW: the guest runs directly on the current thread, behaving the same as with no front end (windowless tests use this).
 // Key map (Nintendo layout): WASD left stick, arrow keys D-pad, J=A K=B U=X I=Y, Q=L E=R, Z=ZL C=ZR, F=press left stick G=press right stick, Return=+ Tab=−.
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <Metal/Metal.h>
+#import <GameController/GameController.h>
 #include "dm.h"
 #include "dm_input.h"
+#include "dm_padmap.h"
 #include "dm_uiscreen.h"
 void mtl_set_ui_rect_fn(void (*fn)(double *y, double *h));
 static void ui_rect_frac(double *fy, double *fh) { int x, y, w, h, rw = 0, rh = 0; dm_ui_rect(&x, &y, &w, &h); if (dm_screen_real(&rw, &rh) && rh > 0) { *fy = (double)y / rh; *fh = (double)h / rh; } }   // Same as front_ios.m: vertical position and height of the UI rectangle (as fractions of the frame height)
@@ -48,6 +50,76 @@ static void on_key(NSEvent *e, int down) {
     push();
 }
 
+// Physical controller. GameController reports face buttons by position (buttonA bottom, buttonB right, buttonX left, buttonY top). dm_padmap.h turns that into Switch or Xbox game keys from the controller's name. Shoulders and sticks stay positional.
+static int32_t pad_axis(float v) {
+    if (v > 1.f) v = 1.f; if (v < -1.f) v = -1.f;
+    int32_t a = (int32_t)(v * 32767.f);
+    if (a > -4000 && a < 4000) return 0;
+    return a;
+}
+static void pad_read(GCController *c) {
+    GCExtendedGamepad *g = c.extendedGamepad;
+    if (!g) return;
+    const char *cat = c.productCategory.UTF8String ?: "";
+    const char *ven = c.vendorName.UTF8String ?: "";
+    int kind = dm_padmap_kind(cat, ven);
+    uint64_t m = dm_padmap_face(kind, g.buttonA.isPressed, g.buttonB.isPressed, g.buttonX.isPressed, g.buttonY.isPressed);
+    if (g.leftShoulder.isPressed) m |= DM_BTN_L;
+    if (g.rightShoulder.isPressed) m |= DM_BTN_R;
+    if (g.leftTrigger.isPressed) m |= DM_BTN_ZL;
+    if (g.rightTrigger.isPressed) m |= DM_BTN_ZR;
+    if (g.buttonMenu.isPressed) m |= DM_BTN_PLUS;
+    if (g.buttonOptions && g.buttonOptions.isPressed) m |= DM_BTN_MINUS;
+    if (g.leftThumbstickButton && g.leftThumbstickButton.isPressed) m |= DM_BTN_LS;
+    if (g.rightThumbstickButton && g.rightThumbstickButton.isPressed) m |= DM_BTN_RS;
+    if (g.dpad.left.isPressed) m |= DM_BTN_LEFT;
+    if (g.dpad.up.isPressed) m |= DM_BTN_UP;
+    if (g.dpad.right.isPressed) m |= DM_BTN_RIGHT;
+    if (g.dpad.down.isPressed) m |= DM_BTN_DOWN;
+    int32_t lx = pad_axis(g.leftThumbstick.xAxis.value), ly = pad_axis(g.leftThumbstick.yAxis.value);
+    int32_t rx = pad_axis(g.rightThumbstick.xAxis.value), ry = pad_axis(g.rightThumbstick.yAxis.value);
+    static int got_in;
+    if (!got_in && (m || lx || ly || rx || ry)) { got_in = 1; LOG("手柄：收到输入 %#llx", (unsigned long long)m); }
+    dm_pad_set(m, lx, ly, rx, ry);
+}
+static void pad_poll(void) {
+    int n = 0;
+    for (GCController *c in GCController.controllers) if (c.extendedGamepad) { n++; pad_read(c); }
+    if (!n) dm_pad_set(0, 0, 0, 0, 0);
+}
+static NSMutableArray *g_obs;
+static void pad_sync(void) {
+    int n = 0;
+    GCController *last = nil;
+    for (GCController *c in GCController.controllers) if (c.extendedGamepad) {
+        n++;
+        last = c;
+        c.handlerQueue = dispatch_get_main_queue();
+        __weak GCController *weak = c;
+        c.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *el) {
+            (void)g; (void)el;
+            GCController *now = weak;
+            if (now) pad_read(now);
+        };
+        pad_read(c);
+    }
+    if (!n) dm_pad_set(0, 0, 0, 0, 0);
+    static int seen = -1;
+    if (n != seen) {
+        int prev = seen; seen = n;
+        if (n && last) LOG("手柄：接入 %s（%s排法）", last.vendorName.UTF8String ?: "?", dm_padmap_kind(last.productCategory.UTF8String ?: "", last.vendorName.UTF8String ?: "") ? "任天堂" : "Xbox");
+        else if (prev > 0) LOG("手柄：已断开");
+    }
+}
+
+@interface DmFront : NSObject<NSApplicationDelegate, NSWindowDelegate>
+@end
+static DmFront *g_front;
+@implementation DmFront
+- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)app { (void)app; return YES; }
+- (BOOL)windowShouldClose:(NSWindow *)sender { (void)sender; [NSApp terminate:nil]; return YES; }
+@end
+
 typedef struct { void (*fn)(void); } guest_arg;
 static void *guest_tramp(void *p) {
     static char alt[65536];                       // The signal alternate stack is per thread; crash printing must also work on the guest thread
@@ -60,11 +132,22 @@ void front_run(void (*guest)(void)) {
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        g_front = [DmFront new];
+        NSApp.delegate = g_front;
+        NSMenu *bar = [NSMenu new];
+        NSMenuItem *app_item = [NSMenuItem new];
+        [bar addItem:app_item];
+        NSMenu *app_menu = [NSMenu new];
+        [app_menu addItemWithTitle:[NSString stringWithFormat:@"Quit %s", DM_GAME_NAME] action:@selector(terminate:) keyEquivalent:@"q"];
+        app_item.submenu = app_menu;
+        NSApp.mainMenu = bar;
         NSRect r = NSMakeRect(0, 0, 1280, 720);
         NSWindow *win = [[NSWindow alloc] initWithContentRect:r
-                                                    styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
+                                                    styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
                                                       backing:NSBackingStoreBuffered defer:NO];
         win.title = @DM_GAME_NAME;   // the game profile's name (game name label)
+        win.delegate = g_front;
+        win.releasedWhenClosed = NO;
         NSView *v = win.contentView;
         v.wantsLayer = YES;
         g_layer = [CAMetalLayer layer];
@@ -77,26 +160,51 @@ void front_run(void (*guest)(void)) {
         [NSApp activateIgnoringOtherApps:YES];
         [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskKeyUp handler:^NSEvent *(NSEvent *e) {
             if (e.window != win) return e;   // Only swallow keys for the game window; other windows such as the software keyboard input box receive typing as usual
+            if (e.modifierFlags & NSEventModifierFlagCommand) {   // Cmd keyDown reaches Quit; keyUp still clears the latch
+                if (e.type == NSEventTypeKeyUp) on_key(e, 0);
+                return e;
+            }
             if (!e.isARepeat) on_key(e, e.type == NSEventTypeKeyDown);
             return nil;   // Swallow it to avoid the system beep
         }];
         // Mouse as a single-point touchscreen (for testing touch on the local machine, front.h dm_touch_set): left button down / drag = finger 0 at the normalized coordinates, release = lifted
+        // Title-bar traffic lights are outside the content view. Swallowing those clicks leaves the close button dead.
         [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskLeftMouseDown | NSEventMaskLeftMouseDragged | NSEventMaskLeftMouseUp handler:^NSEvent *(NSEvent *e) {
             if (e.window != win) return e;
+            NSPoint p = [v convertPoint:e.locationInWindow fromView:nil];
+            if (!NSMouseInRect(p, v.bounds, v.isFlipped)) {
+                if (e.type == NSEventTypeLeftMouseUp) dm_touch_set(NULL, 0);
+                return e;
+            }
             if (e.type == NSEventTypeLeftMouseUp) { dm_touch_set(NULL, 0); return nil; }
-            NSPoint p = [v convertPoint:e.locationInWindow fromView:nil]; NSSize sz = v.bounds.size;
+            NSSize sz = v.bounds.size;
             if (sz.width <= 0 || sz.height <= 0) return e;
             dm_touch t = {0, (float)(p.x / sz.width), (float)(1.0 - p.y / sz.height)};   // The AppKit view origin is at bottom left, the touchscreen origin is at top left
             dm_touch_set(&t, 1); return nil;
         }];
-        [[NSNotificationCenter defaultCenter] addObserverForName:NSWindowWillCloseNotification object:win queue:nil
-                                                      usingBlock:^(NSNotification *n) { (void)n; exit(0); }];
-        // Lifecycle (hle.h / dm.h): focus lost → 2, focus regained → 1; minimized → 3 + audio paused + GPU suspended, restored → resume (followed by focus regained → 1)
+        // Observers must be retained or ARC drops them.
+        g_obs = [NSMutableArray new];
         NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
-        [nc addObserverForName:NSWindowDidResignKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; if (!win.miniaturized) dm_focus_set(2); }];
-        [nc addObserverForName:NSWindowDidBecomeKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; dm_focus_set(1); }];
-        [nc addObserverForName:NSWindowDidMiniaturizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; dm_focus_set(3); dm_audio_suspend(1); dm_gfx_suspend(1); }];
-        [nc addObserverForName:NSWindowDidDeminiaturizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; dm_gfx_suspend(0); dm_audio_suspend(0); dm_focus_set(2); }];
+        void (^hold)(NSNotificationName, id, void (^)(NSNotification *)) = ^(NSNotificationName name, id obj, void (^block)(NSNotification *)) {
+            id o = [nc addObserverForName:name object:obj queue:nil usingBlock:block];
+            if (o) [g_obs addObject:o];
+        };
+        hold(NSWindowWillCloseNotification, win, ^(NSNotification *n) { (void)n; [NSApp terminate:nil]; });
+        // Lifecycle (hle.h / dm.h): focus lost → 2, focus regained → 1; minimized → 3 + audio paused + GPU suspended, restored → resume (followed by focus regained → 1)
+        hold(NSWindowDidResignKeyNotification, win, ^(NSNotification *n) { (void)n; if (!win.miniaturized) dm_focus_set(2); });
+        hold(NSWindowDidBecomeKeyNotification, win, ^(NSNotification *n) { (void)n; dm_focus_set(1); });
+        hold(NSWindowDidMiniaturizeNotification, win, ^(NSNotification *n) { (void)n; dm_focus_set(3); dm_audio_suspend(1); dm_gfx_suspend(1); });
+        hold(NSWindowDidDeminiaturizeNotification, win, ^(NSNotification *n) { (void)n; dm_gfx_suspend(0); dm_audio_suspend(0); dm_focus_set(2); });
+        hold(GCControllerDidConnectNotification, nil, ^(NSNotification *n) { (void)n; pad_sync(); });
+        hold(GCControllerDidDisconnectNotification, nil, ^(NSNotification *n) { (void)n; pad_sync(); });
+        if (@available(macOS 11.3, *)) GCController.shouldMonitorBackgroundEvents = YES;
+        [GCController startWirelessControllerDiscoveryWithCompletionHandler:^{ dispatch_async(dispatch_get_main_queue(), ^{ pad_sync(); }); }];
+        pad_sync();
+        for (NSNumber *ms in @[ @200, @800, @2000 ]) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)ms.doubleValue * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ pad_sync(); });
+        }
+        NSTimer *pt = [NSTimer timerWithTimeInterval:1.0 / 120.0 repeats:YES block:^(NSTimer *t) { (void)t; pad_poll(); }];
+        [[NSRunLoop mainRunLoop] addTimer:pt forMode:NSRunLoopCommonModes];
         // Guest thread: 64 MiB stack (the Switch main thread stack is specified by npdm; the host gives plenty)
         static guest_arg ga; ga.fn = guest;
         pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 64u << 20);
